@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AirDrop
+Comment=Send files to nearby iPhones, iPads and Macs
+Exec=airdrop-app %F
+Icon=folder-download
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=airdrop;apple;iphone;share;send;
+StartupNotify=true

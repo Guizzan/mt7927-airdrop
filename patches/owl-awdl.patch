@@ -1,0 +1,258 @@
+diff --git a/daemon/core.c b/daemon/core.c
+index db63db7..98518cb 100644
+--- a/daemon/core.c
++++ b/daemon/core.c
+@@ -1,3 +1,5 @@
++#include <sys/wait.h>
++#include <unistd.h>
+ /*
+  * OWL: an open Apple Wireless Direct Link (AWDL) implementation
+  * Copyright (C) 2018  The Open Wireless Link Project (https://owlink.org)
+@@ -125,6 +127,39 @@ static void awdl_send_addba_response(struct daemon_state *state) {
+ 	state->awdl_state.stats.tx_action++;
+ }
+ 
++/* Local patch: after answering an ADDBA request, let the driver set up the
++ * hardware side of the session (a station entry and a firmware RX Block Ack),
++ * which mac80211 never does for AWDL's foreign BSSID. Runs ADDBA_HOOK with
++ * PEER TID SSN BUFSIZE, if it exists. */
++#define ADDBA_HOOK "/usr/lib/omdrop/awdl-ba-hook"
++static void awdl_addba_hook(const struct awdl_state *awdl) {
++	char peer[18], tid[4], ssn[8], size[8];
++	unsigned int buf_size = (awdl->addba.params >> 6) & 0x3ff;
++	pid_t pid;
++
++	if (access(ADDBA_HOOK, X_OK))
++		return;
++	if (buf_size == 0 || buf_size > 64)
++		buf_size = 64;
++	snprintf(peer, sizeof(peer), "%02x:%02x:%02x:%02x:%02x:%02x",
++	         awdl->addba.peer.ether_addr_octet[0], awdl->addba.peer.ether_addr_octet[1],
++	         awdl->addba.peer.ether_addr_octet[2], awdl->addba.peer.ether_addr_octet[3],
++	         awdl->addba.peer.ether_addr_octet[4], awdl->addba.peer.ether_addr_octet[5]);
++	snprintf(tid, sizeof(tid), "%u", (awdl->addba.params >> 2) & 0xf);
++	snprintf(ssn, sizeof(ssn), "%u", awdl->addba.ssn);
++	snprintf(size, sizeof(size), "%u", buf_size);
++	/* Waited for: a peer sends ADDBA requests back to back, and run side by
++	 * side their sessions were set up out of order, the later one with an
++	 * older starting sequence. The hook takes a few milliseconds. */
++	pid = fork();
++	if (pid == 0) {
++		execl(ADDBA_HOOK, ADDBA_HOOK, peer, tid, ssn, size, (char *) NULL);
++		_exit(127);
++	}
++	if (pid > 0)
++		waitpid(pid, NULL, 0);
++}
++
+ void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint8_t *buf) {
+ #define MAX_NUM_AMPDU 16 /* TODO lookup this constant from the standard */
+ 	struct daemon_state *state = (void *) user;
+@@ -133,8 +168,10 @@ void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint
+ 	struct buf *data_arr[MAX_NUM_AMPDU];
+ 	struct buf **data = &data_arr[0];
+ 	result = awdl_rx(frame, &data, &data_arr[MAX_NUM_AMPDU], &state->awdl_state);
+-	if (result == RX_ADDBA)
++	if (result == RX_ADDBA) {
+ 		awdl_send_addba_response(state);
++		awdl_addba_hook(&state->awdl_state);
++	}
+ 	/* An A-MSDU that fails part way has converted the subframes before the
+ 	 * failure: free those too, unsent. */
+ 	for (struct buf **data_start = &data_arr[0]; data_start < data; data_start++) {
+diff --git a/daemon/owl.c b/daemon/owl.c
+index ccab874..86030c5 100644
+--- a/daemon/owl.c
++++ b/daemon/owl.c
+@@ -107,7 +107,7 @@ int main(int argc, char *argv[]) {
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FEA")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FEAQ")) != -1) {
+ 		switch (c) {
+ 			case 'm': {
+ 				/* Our AWDL address, instead of the monitor interface's MAC. On
+@@ -189,6 +189,9 @@ int main(int argc, char *argv[]) {
+ 				 * first, then counter (see awdl_election_compare_master). */
+ 				metric_first = 1;
+ 				break;
++			case 'Q':
++				awdl_unicast_ack = 1;
++				break;
+ 			case 'F':
+ 				/* The radio stays on -c's channel and that channel wasn't chosen
+ 				 * to suit the peers: send multicast in any slot, and unicast in
+@@ -257,6 +260,9 @@ int main(int argc, char *argv[]) {
+ 		case 36:
+ 			chan = CHAN_OPCLASS_36;
+ 			break;
++		case 40:
++			chan = CHAN_OPCLASS_40;
++			break;
+ 		case 44:
+ 			chan = CHAN_OPCLASS_44;
+ 			break;
+diff --git a/src/channel.h b/src/channel.h
+index e49fc16..171f94c 100644
+--- a/src/channel.h
++++ b/src/channel.h
+@@ -54,6 +54,7 @@ struct awdl_chan {
+  * advertising 36 in 6 of 16 slots against only 2 on 149. Same 5 GHz opclass as
+  * 44 and 149. */
+ #define CHAN_OPCLASS_36 (struct awdl_chan) { { { 36, 0x80 } } }
++#define CHAN_OPCLASS_40 (struct awdl_chan) { { { 40, 0x80 } } }
+ #define CHAN_OPCLASS_44 (struct awdl_chan) { { { 44, 0x80 } } }
+ #define CHAN_OPCLASS_149 (struct awdl_chan) { { { 149, 0x80 } } }
+ 
+diff --git a/src/frame.h b/src/frame.h
+index e4fc8cc..0bec613 100644
+--- a/src/frame.h
++++ b/src/frame.h
+@@ -180,7 +180,7 @@ struct awdl_ht_capabilities_tlv {
+ 	uint16_t unknown;
+ 	uint16_t ht_capabilities;
+ 	uint8_t ampdu_params;
+-	uint8_t rx_mcs;
++	uint8_t rx_mcs[2]; /* local patch: two streams, as a 2x2 Mac sends (length 9) */
+ 	uint16_t unknown2;
+ } __attribute__((__packed__));
+ 
+diff --git a/src/rx.c b/src/rx.c
+index a4b8694..52e322c 100644
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -292,6 +292,7 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 			state->addba.token = body[2];
+ 			state->addba.params = (uint16_t) (body[3] | body[4] << 8);
+ 			state->addba.timeout = (uint16_t) (body[5] | body[6] << 8);
++			state->addba.ssn = (uint16_t) ((body[7] | body[8] << 8) >> 4);
+ 			return RX_ADDBA;
+ 		}
+ 	}
+diff --git a/src/state.h b/src/state.h
+index 191cf5a..2dff35c 100644
+--- a/src/state.h
++++ b/src/state.h
+@@ -85,6 +85,7 @@ struct awdl_state {
+ 		uint8_t token;
+ 		uint16_t params; /* Block Ack Parameter Set, as requested */
+ 		uint16_t timeout;
++		uint16_t ssn; /* starting sequence number */
+ 	} addba;
+ 	signed char rssi_threshold; /* peers exceeding this threshold are discovered */
+ 	signed char rssi_grace; /* once discovered accept lower RSSI */
+diff --git a/src/tx.c b/src/tx.c
+index ac38c2e..a4a6da3 100644
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -1,3 +1,4 @@
++#include <unistd.h>
+ /*
+  * OWL: an open Apple Wireless Direct Link (AWDL) implementation
+  * Copyright (C) 2018  The Open Wireless Link Project (https://owlink.org)
+@@ -232,9 +233,13 @@ int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state _
+ 	tlv->length = htole16(sizeof(struct awdl_ht_capabilities_tlv) - sizeof(struct tl));
+ 
+ 	/* TODO extract capabilities from nl80211 (nl80211_band_attr) */
+-	tlv->ht_capabilities = htole16(0x11ce);
+-	tlv->ampdu_params = 0x1b;
+-	tlv->rx_mcs = 0xff; /* one stream, all MCS */
++	/* Local patch: what a 2x2 Mac (Mac16,10, macOS 26) advertises: LDPC,
++	 * 20/40 MHz, SM PS off, SGI 20/40; 64 KiB A-MPDU; MCS 0-15. The old
++	 * value (no SGI20, one stream) left a Mac sending to us at MCS 1. */
++	tlv->ht_capabilities = htole16(0x006f);
++	tlv->ampdu_params = 0x1f;
++	tlv->rx_mcs[0] = 0xff;
++	tlv->rx_mcs[1] = 0xff;
+ 
+ 	tlv->unknown = htole16(0);
+ 	tlv->unknown2 = htole16(0);
+@@ -242,6 +247,25 @@ int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state _
+ 	return sizeof(struct awdl_ht_capabilities_tlv);
+ }
+ 
++/* Local patch: TLV 17 wraps standard 802.11 elements. A Mac puts its VHT
++ * Capabilities element here, and without one it treats us as HT only. These
++ * are a 2x2 Mac's bytes: max MPDU 11454, RX LDPC, SGI 80, MCS 0-9 on 2 streams. */
++int awdl_init_vht_container_tlv(uint8_t *buf, const struct awdl_state *state __attribute__((unused))) {
++	static const uint8_t vht_ie[] = {
++		191, 12,                /* VHT Capabilities, length 12 */
++		0x36, 0x00, 0x80, 0x03, /* VHT Capabilities Info */
++		0xfa, 0xff, 0x00, 0x00, /* RX MCS map, highest rate */
++		0xfa, 0xff, 0x00, 0x00, /* TX MCS map, highest rate */
++	};
++	uint16_t len = sizeof(vht_ie);
++
++	buf[0] = AWDL_IEEE80211_CNTNR_TLV;
++	buf[1] = (uint8_t) (len & 0xff);
++	buf[2] = (uint8_t) (len >> 8);
++	memcpy(buf + 3, vht_ie, len);
++	return 3 + len;
++}
++
+ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *state) {
+ 	struct awdl_data_path_state_tlv *tlv = (struct awdl_data_path_state_tlv *) buf;
+ 
+@@ -297,6 +321,8 @@ int awdl_init_version_tlv(uint8_t *buf, const struct awdl_state *state) {
+ }
+ 
+ struct ieee80211_tx_rate awdl_data_tx_rate = { .legacy = 12, .mcs = -1, .sgi = 0 };
++/* Local patch: -Q keeps hardware retries (ACK) for unicast under -F. */
++int awdl_unicast_ack = 0;
+ 
+ static const struct ieee80211_tx_rate legacy_12 = { .legacy = 12, .mcs = -1, .sgi = 0 };
+ 
+@@ -448,7 +474,11 @@ int awdl_init_addba_response(uint8_t *buf, const struct awdl_state *state,
+ 		size = 64;
+ 	/* bit 0 A-MSDU supported (no), bit 1 immediate Block Ack, bits 2-5 TID,
+ 	 * bits 6-15 buffer size */
++	/* Local patch: bit 0 (A-MSDU in A-MPDU) is granted when the peer asks
++	 * and /etc/omdrop/amsdu exists; rx.c splits A-MSDUs. */
+ 	params = (uint16_t) ((state->addba.params & 0x003c) | 0x0002 | (size << 6));
++	if (access("/etc/omdrop/amsdu", F_OK) == 0 && (state->addba.params & 0x0001))
++		params |= 0x0001;
+ 
+ 	ptr += ieee80211_init_radiotap_header(ptr);
+ 	ptr += ieee80211_init_awdl_action_hdr(ptr, &state->self_address, &state->addba.peer, ieee80211_state);
+@@ -479,8 +509,10 @@ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct i
+ 	ptr += awdl_init_chanseq_tlv(ptr, state);
+ 	ptr += awdl_init_election_params_v2_tlv(ptr, state);
+ 	ptr += awdl_init_service_params_tlv(ptr, state);
+-	if (type == AWDL_ACTION_MIF)
++	if (type == AWDL_ACTION_MIF) {
+ 		ptr += awdl_init_ht_capabilities_tlv(ptr, state);
++		ptr += awdl_init_vht_container_tlv(ptr, state);
++	}
+ 	if (type == AWDL_ACTION_MIF)
+ 		ptr += awdl_init_arpa_tlv(ptr, state);
+ 	ptr += awdl_init_data_path_state_tlv(ptr, state);
+@@ -501,7 +533,7 @@ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const
+ 	 * every frame queued behind it until the peer has long gone; a transfer then
+ 	 * stalls on "Waiting". Sent once, without an ACK, a lost frame costs a TCP
+ 	 * retransmission instead. Multicast is never ACKed anyway. */
+-	int noack = state->channel.fixed_radio && !(dst->ether_addr_octet[0] & 1);
++	int noack = state->channel.fixed_radio && !awdl_unicast_ack && !(dst->ether_addr_octet[0] & 1);
+ 
+ 	ptr += init_radiotap_header(ptr, &awdl_data_tx_rate, noack);
+ 	ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);
+diff --git a/src/tx.h b/src/tx.h
+index 0f0c7ba..f914b49 100644
+--- a/src/tx.h
++++ b/src/tx.h
+@@ -47,6 +47,7 @@ int awdl_init_election_params_v2_tlv(uint8_t *buf, const struct awdl_state *);
+ int awdl_init_service_params_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *);
++int awdl_init_vht_container_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+@@ -73,6 +74,7 @@ struct ieee80211_tx_rate {
+ /* Data frames are injected at this rate; see owl -R. Action frames always use
+  * legacy 12 Mbit/s, as iPhones do for theirs. */
+ extern struct ieee80211_tx_rate awdl_data_tx_rate;
++extern int awdl_unicast_ack;
+ 
+ int ieee80211_parse_tx_rate(const char *s, struct ieee80211_tx_rate *rate);
+ 

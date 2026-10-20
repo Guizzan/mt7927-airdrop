@@ -1,0 +1,89 @@
+--- a/userspace/omdrop-discoverable
++++ b/userspace/omdrop-discoverable
+@@ -166,13 +166,19 @@
+     *) order="44 149 6" ;;
+   esac
+   if [ "${PROF_MODE:-}" = active-monitor ]; then
+-    case "${2:-}" in
+-      mt76x2u) order="149 44 6" ;;
+-      *) order=6 ;;
+-    esac
++    # Local patch: $CONF/channels overrides, so an mt7925e (MT7927) can sit
++    # on 5 GHz, where an iPhone gives AWDL most of its slots.
++    if [ -r "$CONF/channels" ]; then
++      order=$(cat "$CONF/channels")
++    else
++      case "${2:-}" in
++        mt76x2u) order="149 44 6" ;;
++        *) order=6 ;;
++      esac
++    fi
+   fi
+   for c in $order; do
+-    case "$c" in 6) f=2437 ;; 44) f=5220 ;; 149) f=5745 ;; *) continue ;; esac
++    case "$c" in 6) f=2437 ;; 36) f=5180 ;; 40) f=5200 ;; 44) f=5220 ;; 149) f=5745 ;; *) continue ;; esac
+     grep -qx "$f" <<< "$ok" && echo "$f"
+   done
+ }
+@@ -320,11 +326,21 @@
+   sysctl -qw "net.ipv6.conf.$AP.disable_ipv6=1" 2>/dev/null
+   nmcli device set "$AP" managed no >/dev/null 2>&1
+   for f in "$@"; do
+-    case "$f" in 2437) ch=6 mode=g ;; 5220) ch=44 mode=a ;; 5745) ch=149 mode=a ;; *) continue ;; esac
++    case "$f" in 2437) ch=6 mode=g ;; 5180) ch=36 mode=a ;; 5200) ch=40 mode=a ;; 5220) ch=44 mode=a ;; 5745) ch=149 mode=a ;; *) continue ;; esac
++    # Local patch: $CONF/vht80 1 makes a 5 GHz cell VHT80 (AWDL's 5 GHz
++    # channels are 80 MHz wide), so the chip receives a peer's 80 MHz frames.
++    local wide=()
++    if [ "$mode" = a ] && [ "$(knob vht80)" = 1 ]; then
++      case "$ch" in
++        36|44) wide=("ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]" ieee80211ac=1 vht_oper_chwidth=1 vht_oper_centr_freq_seg0_idx=42 "vht_capab=[SHORT-GI-80][RXLDPC][MAX-MPDU-11454]") ;;
++        40) wide=("ht_capab=[HT40-][SHORT-GI-20][SHORT-GI-40][LDPC]" ieee80211ac=1 vht_oper_chwidth=1 vht_oper_centr_freq_seg0_idx=42 "vht_capab=[SHORT-GI-80][RXLDPC][MAX-MPDU-11454]") ;;
++        149) wide=("ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]" ieee80211ac=1 vht_oper_chwidth=1 vht_oper_centr_freq_seg0_idx=155 "vht_capab=[SHORT-GI-80][RXLDPC][MAX-MPDU-11454]") ;;
++      esac
++    fi
+     ( umask 077
+       printf '%s\n' "interface=$AP" driver=nl80211 \
+         "ssid=omdrop-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')" ignore_broadcast_ssid=1 \
+-        "hw_mode=$mode" "channel=$ch" ieee80211n=1 beacon_int=1000 \
++        "hw_mode=$mode" "channel=$ch" ieee80211n=1 beacon_int=1000 "${wide[@]}" \
+         wpa=2 wpa_key_mgmt=WPA-PSK rsn_pairwise=CCMP \
+         "wpa_passphrase=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" > "$conf" )
+     # 9>&-: the daemon must not keep the start lock.
+@@ -623,7 +639,7 @@
+     ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
+   fi
+   case "$ap" in
+-    2437) chan=6 ;; 5220) chan=44 ;; 5745) chan=149 ;;
++    2437) chan=6 ;; 5180) chan=36 ;; 5200) chan=40 ;; 5220) chan=44 ;; 5745) chan=149 ;;
+     *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
+   esac
+   stamac=$(cat "/sys/class/net/$sta/address")
+@@ -658,8 +674,15 @@
+   # slots the phone already gives it: those move while the phone makes room
+   # for us, and the intersection trails them by a tick.
+   if [ "$PROF_MODE" != shared ]; then
+-    owl_extra+=(-F -E)
+-    strategy=pin
++    # Local patch: $CONF/hop 1 lets OWL hop channels and follow the phone's
++    # own sequence (like a Mac) instead of pinning one channel (-F, pin).
++    if [ "$(knob hop)" = 1 ]; then
++      owl_extra+=(-E)
++      strategy=$(knob strategy); strategy=${strategy:-verbatim}
++    else
++      owl_extra+=(-F -E)
++      strategy=$(knob strategy); strategy=${strategy:-pin}
++    fi
+   fi
+   # owl -A (patches/owl-10-addba-accept.patch): accept the phone's Block Ack
+   # session request, so it sends A-MPDUs. Unanswered, an iPhone asked 61
+@@ -671,6 +694,10 @@
+   if [ "$aggregation" = 1 ] || { [ -z "$aggregation" ] && [ "$PROF_MODE" = active-monitor ] && [ "$drv" = mt76x2u ]; }; then
+     owl_extra+=(-A)
+   fi
++  # Local patch: extra OWL arguments from $CONF/owl-args (e.g. -Q, -R mcs4).
++  if [ -r "$CONF/owl-args" ]; then
++    read -r -a _args < "$CONF/owl-args" && owl_extra+=("${_args[@]}")
++  fi
+ 
+   # mt76_pm: runtime PM off for the window, restored by stop.
+   mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null

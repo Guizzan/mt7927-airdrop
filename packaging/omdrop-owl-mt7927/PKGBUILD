@@ -1,0 +1,86 @@
+# omdrop-owl with the changes that make AirDrop fast on MediaTek MT7927
+# (hidden-AP mode, hardware Block Ack, HT/VHT capabilities), plus a GTK app.
+# Based on the omdrop-owl PKGBUILD by T4T5 (https://github.com/t4t5/omdrop-owl).
+pkgname=omdrop-owl-mt7927
+_upstream=omdrop-owl
+pkgver=0.3.0
+pkgrel=4
+pkgdesc="AirDrop for Linux on MediaTek MT7927: omdrop-owl with hardware Block Ack and VHT, and a send app"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Guizzan/mt7927-airdrop"
+license=('GPL-3.0-or-later' 'GPL-2.0-only' 'ISC')
+depends=('bash' 'python' 'iproute2' 'iputils' 'iw' 'polkit' 'util-linux' 'procps-ng'
+         'libpcap' 'libev' 'libnl' 'networkmanager' 'keyutils' 'hostapd'
+         'python-libarchive-c' 'python-pillow' 'python-zeroconf' 'python-ifaddr'
+         'bluez' 'python-dbus' 'python-gobject' 'gtk4' 'libadwaita' 'libnotify'
+         'mt7925-awdl-dkms')
+optdepends=('nautilus-python: "Send with AirDrop" in the Files right-click menu')
+makedepends=('git' 'cmake' 'gcc' 'pkgconf')
+provides=("$_upstream=$pkgver")
+conflicts=("$_upstream" 'brcmfmac-awdl-dkms')
+install="$pkgname.install"
+_root="$startdir/../.."
+
+_owl_commit=832d70f815c3d4a06a02117bf0fc5e868daa1ff0
+_omdrop_awdl_commit=534f91a525337951ca19c311e53d333bd6d55100
+source=("${_upstream}-${pkgver}.tar.gz::https://github.com/t4t5/omdrop-owl/archive/refs/tags/v${pkgver}.tar.gz"
+        "owl::git+https://github.com/jedbillyb/owl.git#commit=${_owl_commit}"
+        "googletest::git+https://github.com/google/googletest.git"
+        "radiotap::git+https://github.com/radiotap/radiotap-library.git"
+        "omdrop-awdl::git+https://github.com/brentkearney/omdrop-awdl.git#commit=${_omdrop_awdl_commit}")
+sha256sums=('f64ec24563e70cf923cebc78ad4fa61255f50c319fd98e5706a90f742fe10a5b'
+            'a56d9c05716db293cce2f58a069a7100faedfcf15b4a4bef25c4a7a361dfae3d'
+            'SKIP'
+            'SKIP'
+            '894f99d3e7792142cc9405cf44897b366022e9531ddfba21b01dfa4f3e8588b3')
+
+_from_omdrop_awdl=(send-to-peer airdrop-send.py awdl-af-parse.py awdl_identity.py
+                   awdl_debug.py ble-airdrop-adv.py awdl-airdrop-adv.py awdl-mdns-respond.py)
+
+prepare() {
+  local tree="${srcdir}/${_upstream}-${pkgver}"
+  cd "${srcdir}/owl"
+  git submodule init
+  git config submodule.googletest.url "${srcdir}/googletest"
+  git config submodule.radiotap.url "${srcdir}/radiotap"
+  git -c protocol.file.allow=always submodule update
+  local p
+  for p in "${tree}"/patches/owl-*.patch; do
+    git apply "$p"
+  done
+  git apply "${_root}/patches/owl-awdl.patch"
+  patch -p1 -d "${tree}" < "${_root}/patches/omdrop-discoverable.patch"
+}
+
+build() {
+  cmake -S owl -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Wno-dev
+  cmake --build build --target owl
+  gcc ${CFLAGS} ${LDFLAGS} -o awdl-sta "${_root}/tools/awdl-sta.c" $(pkg-config --cflags --libs libnl-genl-3.0)
+}
+
+package() {
+  local tree="${srcdir}/${_upstream}-${pkgver}" lib="${pkgdir}/usr/lib/omdrop" f
+  install -Dm755 "${tree}/userspace/omdrop-discoverable" "${lib}/omdrop-discoverable"
+  install -Dm644 "${tree}/userspace/owl-profiles" "${lib}/owl-profiles"
+  install -Dm755 build/daemon/owl "${lib}/owl"
+  install -Dm755 awdl-sta "${lib}/awdl-sta"
+  install -Dm755 "${_root}/tools/awdl-ba-hook" "${lib}/awdl-ba-hook"
+  for f in "${_from_omdrop_awdl[@]}"; do
+    install -Dm755 "omdrop-awdl/userspace/${f}" "${lib}/${f}"
+  done
+  install -Dm644 "${tree}/packaging/omdrop-owl.policy" \
+    "${pkgdir}/usr/share/polkit-1/actions/io.github.t4t5.omdrop-owl.policy"
+  install -Dm644 "${tree}/packaging/99-omdrop-owl-unmanaged.conf" \
+    "${pkgdir}/usr/lib/NetworkManager/conf.d/99-omdrop-owl-unmanaged.conf"
+  install -Dm644 "${tree}/packaging/10-omdrop-owl-awdl0.link" \
+    "${pkgdir}/usr/lib/systemd/network/10-omdrop-owl-awdl0.link"
+  install -Dm755 "${_root}/app/airdrop-app" "${pkgdir}/usr/bin/airdrop-app"
+  install -Dm644 "${_root}/app/io.github.guizzan.AirDrop.desktop" \
+    "${pkgdir}/usr/share/applications/io.github.guizzan.AirDrop.desktop"
+  install -Dm644 "${_root}/app/nautilus-airdrop.py" \
+    "${pkgdir}/usr/share/nautilus-python/extensions/airdrop.py"
+  install -Dm644 "${_root}/config/omdrop/"* -t "${pkgdir}/usr/share/doc/${pkgname}/etc-omdrop/"
+  install -Dm644 owl/COPYING "${pkgdir}/usr/share/licenses/${pkgname}/OWL-GPL-3.0"
+  install -Dm644 omdrop-awdl/LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/omdrop-awdl-LICENSE"
+  install -Dm644 owl/radiotap/COPYING "${pkgdir}/usr/share/licenses/${pkgname}/radiotap-ISC"
+}

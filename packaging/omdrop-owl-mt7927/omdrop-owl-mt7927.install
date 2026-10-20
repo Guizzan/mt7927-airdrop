@@ -1,0 +1,16 @@
+post_install() {
+  if [ ! -e /etc/omdrop/owl-profiles ]; then
+    mkdir -p /etc/omdrop
+    cp -n /usr/share/doc/omdrop-owl-mt7927/etc-omdrop/* /etc/omdrop/
+    echo "  Installed the MT7927 settings into /etc/omdrop."
+  fi
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    nmcli general reload conf >/dev/null 2>&1 || true
+  fi
+  cat <<'MSG'
+  5 GHz needs a regulatory domain: set WIRELESS_REGDOM in /etc/conf.d/wireless-regdom.
+  Then: omdrop on 10m   (or open the AirDrop app)
+MSG
+}
+post_upgrade() { post_install; }
+pre_remove() { /usr/lib/omdrop/omdrop-discoverable stop >/dev/null 2>&1 || true; }

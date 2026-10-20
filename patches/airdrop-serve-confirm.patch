@@ -1,0 +1,72 @@
+--- a/bin/airdrop-serve.py
++++ b/bin/airdrop-serve.py
+@@ -58,7 +58,7 @@
+ # convenience for writing a value, not what makes it safe. Reload = restart.
+ CONFIG_PATH = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.config'),
+                            'airdrop', 'config.toml')
+-CONFIG_KEYS = ('name', 'model', 'download_dir', 'max_receive_percent')
++CONFIG_KEYS = ('name', 'model', 'download_dir', 'max_receive_percent', 'confirm', 'confirm_timeout')
+ STRING_CONFIG_KEYS = ('name', 'model', 'download_dir')
+ DEFAULT_MAX_RECEIVE_PERCENT = 30
+ 
+@@ -69,6 +69,35 @@
+     return socket.gethostname().split('.')[0] or 'omdrop'
+ 
+ 
++def confirm_transfer(ask, files, items):
++    """Show an Accept/Decline notification for an incoming Ask and wait for
++    the answer. No answer within CONFIRM_TIMEOUT, or no way to ask, declines."""
++    sender = ask.get('SenderComputerName') or 'Someone'
++    if files:
++        names = [f.get('FileName') or '?' for f in files]
++        size = sum(int(f.get('FileSize') or 0) for f in files)
++        what = ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '')
++        if size:
++            what += f' ({size / 1e6:.1f} MB)' if size >= 1e5 else f' ({size / 1e3:.0f} kB)'
++    elif items:
++        what = str(items[0])[:120]
++    else:
++        what = 'a file'
++    try:
++        r = subprocess.run(
++            ['notify-send', '--app-name=AirDrop', '--icon=folder-download',
++             '--urgency=critical', f'--expire-time={CONFIRM_TIMEOUT * 1000}',
++             '--action=accept=Accept', '--action=decline=Decline', '--wait',
++             f'AirDrop from {sender}', what],
++            capture_output=True, text=True, timeout=CONFIRM_TIMEOUT + 5)
++        answer = r.stdout.strip()
++    except (OSError, subprocess.SubprocessError) as e:
++        logging.warning('could not ask about the transfer (%r); declining', e)
++        return False
++    logging.info('confirmation for %s: %s', sender, answer or 'no answer')
++    return answer == 'accept'
++
++
+ def load_config(path):
+     """Read the TOML; unknown keys are an error (a typo must not silently fall
+     back to a default), missing file is fine (defaults apply)."""
+@@ -154,6 +183,10 @@
+ _cfg = load_config(args.config)
+ NAME = validate_name(args.name if args.name is not None else _cfg.get('name') or default_receiver_name())
+ MODEL = validate_model(args.model if args.model is not None else _cfg.get('model', 'MacBookPro18,3'))
++# Ask before accepting a transfer, like a Mac: a desktop notification with
++# Accept/Decline. `confirm = false` in config.toml accepts everything.
++CONFIRM = bool(_cfg.get('confirm', True))
++CONFIRM_TIMEOUT = int(_cfg.get('confirm_timeout', 60))
+ _outdir = args.outdir if args.outdir is not None else _cfg.get('download_dir', os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'Downloads'))
+ # Resolved once; never chdir -- cwd is process-global and the server is threaded.
+ DEST = validate_download_dir(_outdir)
+@@ -987,6 +1020,13 @@
+             # so an Upload that never passed an Ask has nothing vouching for it.
+             self._contacts_ok = True
+ 
++        if CONFIRM and not confirm_transfer(ask, files, items):
++            logging.info('ask DECLINED by the user')
++            self.send_response(403)
++            self.send_header('Content-Length', '0')
++            self.end_headers()
++            return
++
+         # A `links` transfer is Ask-only: with SUPPORTS_URL (0x01) advertised,
+         # iOS puts the URL straight into Items and sends no /Upload at all, so
+         # accepting the Ask IS the transfer. Store it, or the link is lost.

@@ -1,0 +1,8 @@
+packaging/*/src/
+packaging/*/pkg/
+packaging/*/*.pkg.tar.zst
+packaging/*/*.tar.gz
+packaging/*/owl/
+packaging/*/googletest/
+packaging/*/radiotap/
+packaging/*/omdrop-awdl/

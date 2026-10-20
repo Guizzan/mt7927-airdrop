@@ -1,0 +1,18 @@
+# Patched mt7925 Wi-Fi driver for AirDrop (AWDL) on MediaTek MT7927 / MT7925.
+pkgname=mt7925-awdl-dkms
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="mt7925e with the fixes AirDrop needs on MT7927: sniffer channel beside an AP, firmware RX Block Ack for AWDL peers (DKMS)"
+arch=('any')
+url="https://github.com/Guizzan/mt7927-airdrop"
+license=('BSD-3-Clause-Clear')
+depends=('dkms' 'git' 'patch')
+_root="$startdir/../.."
+
+package() {
+  local dst="$pkgdir/usr/src/mt7925-awdl-$pkgver"
+  install -Dm644 "$_root/dkms/dkms.conf" "$dst/dkms.conf"
+  sed -i "s/@PKGVER@/$pkgver/" "$dst/dkms.conf"
+  install -Dm755 "$_root/dkms/prepare.sh" "$dst/prepare.sh"
+  install -Dm644 "$_root/patches/mt7925-awdl.patch" "$dst/mt7925-awdl.patch"
+}

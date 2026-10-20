@@ -1,0 +1,39 @@
+#!/bin/bash
+# Called by OWL after it accepts a peer's ADDBA request: PEER TID SSN BUFSIZE.
+# Gives the firmware what an associated station would have: a station entry on
+# the AP vif (awdl-sta) and an RX Block Ack session (mt7925 awdl_rx_ba), so the
+# chip answers the peer's A-MPDUs with a hardware Block Ack.
+peer=$1 tid=$2 ssn=$3 size=$4
+RUN=/run/omdrop-owl
+ap=awdlap0
+log() { echo "$(date +%T.%N | cut -c1-12) $*" >> "$RUN/ba.log"; }
+[ -e "/sys/class/net/$ap" ] || { log "no $ap, skipping $peer"; exit 0; }
+
+# Markers are only valid for the AP they were made on: a new window (or a
+# driver reload) brings up a new AP with no stations, and a peer may come back
+# with the same address.
+apid=$(cat "/sys/class/net/$ap/ifindex")
+dir="$RUN/ba/$apid"
+mkdir -p "$dir"
+key="$dir/${peer//:/}"
+
+if ! iw dev "$ap" station get "$peer" >/dev/null 2>&1; then
+  rm -f "$key"-*
+  out=$(/usr/lib/omdrop/awdl-sta add "$ap" "$peer" 2>&1)
+  log "sta add $peer: ${out:-ok}"
+fi
+# A repeated request for a session we already set up changes nothing; a new
+# starting sequence means the peer restarted it.
+[ "$(cat "$key-$tid" 2>/dev/null)" = "$ssn $size" ] && exit 0
+
+dbg=$(ls -d /sys/kernel/debug/ieee80211/phy*/mt76 2>/dev/null | head -1)
+if [ -w "$dbg/awdl_rx_ba" ]; then
+  if echo "$peer $tid $ssn $size" > "$dbg/awdl_rx_ba" 2>>"$RUN/ba.log"; then
+    echo "$ssn $size" > "$key-$tid"
+    log "rx ba $peer tid $tid ssn $ssn size $size: ok"
+  else
+    log "rx ba $peer tid $tid: failed"
+  fi
+else
+  log "no awdl_rx_ba in $dbg (is mt7925-awdl-dkms loaded?)"
+fi
