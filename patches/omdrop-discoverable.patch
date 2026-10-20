@@ -1,5 +1,5 @@
---- a/userspace/omdrop-discoverable
-+++ b/userspace/omdrop-discoverable
+--- a/userspace/omdrop-discoverable	2026-10-16 17:48:05.000000000 +0300
++++ b/userspace/omdrop-discoverable	2026-10-20 07:28:14.455770057 +0300
 @@ -166,13 +166,19 @@
      *) order="44 149 6" ;;
    esac
@@ -25,7 +25,7 @@
      grep -qx "$f" <<< "$ok" && echo "$f"
    done
  }
-@@ -320,11 +326,21 @@
+@@ -320,16 +326,28 @@
    sysctl -qw "net.ipv6.conf.$AP.disable_ipv6=1" 2>/dev/null
    nmcli device set "$AP" managed no >/dev/null 2>&1
    for f in "$@"; do
@@ -33,6 +33,8 @@
 +    case "$f" in 2437) ch=6 mode=g ;; 5180) ch=36 mode=a ;; 5200) ch=40 mode=a ;; 5220) ch=44 mode=a ;; 5745) ch=149 mode=a ;; *) continue ;; esac
 +    # Local patch: $CONF/vht80 1 makes a 5 GHz cell VHT80 (AWDL's 5 GHz
 +    # channels are 80 MHz wide), so the chip receives a peer's 80 MHz frames.
++    # A 40/80 MHz cell starts with a neighbour scan (HT_SCAN) that can take
++    # longer than 5 s right after a driver load, hence the longer wait below.
 +    local wide=()
 +    if [ "$mode" = a ] && [ "$(knob vht80)" = 1 ]; then
 +      case "$ch" in
@@ -49,7 +51,13 @@
          wpa=2 wpa_key_mgmt=WPA-PSK rsn_pairwise=CCMP \
          "wpa_passphrase=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" > "$conf" )
      # 9>&-: the daemon must not keep the start lock.
-@@ -623,7 +639,7 @@
+     hostapd -B -P "$RUN/hostapd.pid" "$conf" >> "$RUN/hostapd.log" 2>&1 9>&- || continue
+-    for _ in $(seq 100); do
++    for _ in $(seq 300); do
+       iw dev "$AP" info 2>/dev/null | grep -q "channel $ch " && { echo "$f"; return 0; }
+       sleep 0.05
+     done
+@@ -623,7 +641,7 @@
      ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
    fi
    case "$ap" in
@@ -58,7 +66,7 @@
      *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
    esac
    stamac=$(cat "/sys/class/net/$sta/address")
-@@ -658,8 +674,15 @@
+@@ -658,8 +676,15 @@
    # slots the phone already gives it: those move while the phone makes room
    # for us, and the intersection trails them by a tick.
    if [ "$PROF_MODE" != shared ]; then
@@ -76,7 +84,7 @@
    fi
    # owl -A (patches/owl-10-addba-accept.patch): accept the phone's Block Ack
    # session request, so it sends A-MPDUs. Unanswered, an iPhone asked 61
-@@ -671,6 +694,10 @@
+@@ -671,6 +696,10 @@
    if [ "$aggregation" = 1 ] || { [ -z "$aggregation" ] && [ "$PROF_MODE" = active-monitor ] && [ "$drv" = mt76x2u ]; }; then
      owl_extra+=(-A)
    fi

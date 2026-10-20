@@ -18,6 +18,15 @@ mkdir -p "$dir"
 key="$dir/${peer//:/}"
 
 if ! iw dev "$ap" station get "$peer" >/dev/null 2>&1; then
+  # A peer comes back with a new address every session: drop stations that
+  # have been silent for a minute so they don't fill the firmware's table.
+  iw dev "$ap" station dump 2>/dev/null | awk '
+    /^Station/ { mac = $2 }
+    /inactive time:/ { if ($3 > 60000) print mac }' |
+  while read -r old; do
+    /usr/lib/omdrop/awdl-sta del "$ap" "$old" >/dev/null 2>&1 && log "sta del $old (inactive)"
+    rm -f "$dir/${old//:/}"-*
+  done
   rm -f "$key"-*
   out=$(/usr/lib/omdrop/awdl-sta add "$ap" "$peer" 2>&1)
   log "sta add $peer: ${out:-ok}"
