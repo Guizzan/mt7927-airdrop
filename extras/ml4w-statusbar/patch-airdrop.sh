@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Adds the AirDrop module (AirDropModule.qml) to ML4W's statusbar: copies the
-# QML next to StatusbarWindow.qml and registers "airdrop" in it. Idempotent.
+# Adds AirDrop to ML4W's statusbar: copies AirDropModule.qml next to
+# StatusbarWindow.qml, registers the "airdrop" module, and keeps the bar
+# revealed while the AirDrop panel is open (`qs ipc call airdropbar opened` /
+# `closed`, sent by airdrop-app). Idempotent: each part has its own marker.
 # ML4W updates overwrite the bar, so the installer's user post.sh re-runs this:
 #   ~/.config/ml4w-dotfiles-installer/com.ml4w.dotfiles/post.sh
 # Usage: patch-airdrop.sh [path/to/StatusbarWindow.qml]
@@ -8,22 +10,45 @@
 f="${1:-$HOME/.config/quickshell/StatusbarApp/StatusbarWindow.qml}"
 [ -f "$f" ] || { echo "patch-airdrop: $f not found" >&2; exit 1; }
 cp "$HOME/.config/ml4w-statusbar/AirDropModule.qml" "$(dirname "$f")/AirDropModule.qml"
-grep -q 'CUSTOM-AIRDROP-MODULE' "$f" && { echo "patch-airdrop: already patched"; exit 0; }
 
-anchor_comp='    Component { id: cPowerProfile; PowerProfileModule {} }'
-anchor_map='        "powerprofile": cPowerProfile'
-grep -qF "$anchor_comp" "$f" && grep -qF "$anchor_map" "$f" || {
-    echo "patch-airdrop: anchors not found in $f (upstream changed?)" >&2; exit 1; }
-
-python3 -I - "$f" "$anchor_comp" "$anchor_map" <<'PY'
+python3 -I - "$f" <<'PY'
 import sys
-path, anchor_comp, anchor_map = sys.argv[1:4]
+path = sys.argv[1]
 src = open(path).read()
-src = src.replace(anchor_comp, anchor_comp + '''
-    // CUSTOM-AIRDROP-MODULE (patch-airdrop.sh)
-    Component { id: cAirdrop; AirDropModule {} }''', 1)
-src = src.replace(anchor_map, anchor_map + ''',
-        "airdrop":      cAirdrop''', 1)
-open(path, 'w').write(src)
+done = []
+
+def patch(marker, anchor, addition, before=False):
+    global src
+    if marker in src:
+        return
+    if src.count(anchor) != 1:
+        sys.exit(f"patch-airdrop: anchor for {marker} not found (upstream changed?)")
+    src = src.replace(anchor, (addition + anchor) if before else (anchor + addition), 1)
+    done.append(marker)
+
+# The module itself
+patch("CUSTOM-AIRDROP-MODULE",
+      "    Component { id: cPowerProfile; PowerProfileModule {} }",
+      "\n    // CUSTOM-AIRDROP-MODULE (patch-airdrop.sh)\n    Component { id: cAirdrop; AirDropModule {} }")
+patch("cAirdrop,", '        "powerprofile": cPowerProfile', ',\n        "airdrop":      cAirdrop')
+
+# Stay revealed while the AirDrop panel is open
+patch("CUSTOM-AIRDROP-REVEAL",
+      "        || root.barExpanded || root.trayMenuOpen || root.calendarOpen",
+      "\n        || root.airdropOpen // CUSTOM-AIRDROP-REVEAL (patch-airdrop.sh)")
+patch("airdropbar",
+      "    property bool pointerHeld: false\n",
+      """
+    // CUSTOM (patch-airdrop.sh): the AirDrop panel (airdrop-app) drops down
+    // under the bar and keeps it revealed until it closes.
+    property bool airdropOpen: false
+    IpcHandler {
+        target: "airdropbar"
+        function opened(): void { root.airdropOpen = true }
+        function closed(): void { root.airdropOpen = false }
+    }
+""")
+
+open(path, "w").write(src)
+print("patch-airdrop:", ("patched " + ", ".join(done)) if done else "already patched")
 PY
-echo "patch-airdrop: patched $f"

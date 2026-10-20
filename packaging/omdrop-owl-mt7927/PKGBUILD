@@ -4,7 +4,7 @@
 pkgname=omdrop-owl-mt7927
 _upstream=omdrop-owl
 pkgver=0.3.0
-pkgrel=7
+pkgrel=9
 pkgdesc="AirDrop for Linux on MediaTek MT7927: omdrop-owl with hardware Block Ack and VHT, and a send app"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Guizzan/mt7927-airdrop"

@@ -25,7 +25,7 @@ import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 try:
     gi.require_version("Gtk4LayerShell", "1.0")
@@ -42,6 +42,25 @@ PANEL_WIDTH = 420
 PANEL_TOP = 68               # just below the ML4W bar island
 COLORS = os.path.expanduser("~/.config/ml4w/colors/colors.json")
 STATE = os.path.join(GLib.get_user_cache_dir(), "airdrop-app", "anchor")
+LOG = os.path.join(GLib.get_user_cache_dir(), "airdrop-app", "log")
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{GLib.DateTime.new_now_local().format('%T')} {msg}\n")
+    except OSError:
+        pass
+
+
+def tell_bar(state):
+    """Keep the ML4W bar revealed while the panel is open (patch-airdrop.sh)."""
+    qs = shutil.which("qs")
+    if qs:
+        try:
+            run_quiet([qs, "ipc", "call", "airdropbar", state])
+        except GLib.Error:
+            pass
 
 
 def human_size(n):
@@ -163,6 +182,9 @@ class AirDropPanel(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="AirDrop", resizable=False)
         self.add_css_class("airdrop-panel")
+        # The panel draws its own card; a themed .background (glass themes make
+        # it translucent) would tint the transparent margin around it.
+        self.remove_css_class("background")
         self.set_default_size(PANEL_WIDTH, -1)
         self.files = []            # Gio.File
         self.devices = {}          # name -> Adw.ActionRow
@@ -269,8 +291,10 @@ class AirDropPanel(Gtk.ApplicationWindow):
         bottom.append(self.send_button)
         panel.append(bottom)
 
-        # Drops anywhere on the panel count, not only on the zone.
-        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        # Drops anywhere on the panel count, not only on the zone. File lists,
+        # or plain text/uri-list for sources that only offer that.
+        drop = Gtk.DropTarget.new(GObject.TYPE_NONE, Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
+        drop.set_gtypes([Gdk.FileList.__gtype__, GObject.TYPE_STRING])
         drop.set_preload(True)
         drop.connect("drop", self.on_drop)
         drop.connect("enter", self.on_drag_enter)
@@ -308,6 +332,7 @@ class AirDropPanel(Gtk.ApplicationWindow):
     def show_panel(self):
         was_visible = self.get_visible()
         self.present()
+        tell_bar("opened")
         if not was_visible:
             self.refresh_visibility()
             self.start_scan()
@@ -315,6 +340,7 @@ class AirDropPanel(Gtk.ApplicationWindow):
     def hide_panel(self):
         self.stop_scan()
         self.set_visible(False)
+        tell_bar("closed")
 
     def toggle(self):
         if self.get_visible():
@@ -366,26 +392,47 @@ class AirDropPanel(Gtk.ApplicationWindow):
         self.set_files(self.files + list(files))
 
     def on_choose(self, _btn):
+        # No parent: the portal can't export a layer-shell surface as a dialog
+        # parent, and trying makes the compositor drop the connection.
         dialog = Gtk.FileDialog(title="Choose files to send")
-        dialog.open_multiple(self, None, self._chosen)
+        dialog.open_multiple(None, None, self._chosen)
+        log("file chooser opened")
 
     def _chosen(self, dialog, res):
         try:
             model = dialog.open_multiple_finish(res)
-        except GLib.Error:
+        except GLib.Error as e:
+            log(f"file chooser: {e.message}")
             return
-        self.add_files(model.get_item(i) for i in range(model.get_n_items()))
+        files = [model.get_item(i) for i in range(model.get_n_items())]
+        log(f"file chooser: {len(files)} file(s)")
+        self.add_files(files)
+        self.present()
 
-    def on_drag_enter(self, *_):
+    def on_drag_enter(self, target, _x, _y):
+        drop = target.get_current_drop()
+        formats = drop.get_formats().to_string() if drop else "?"
+        log(f"drag enter, formats {formats}")
         self.drop_zone.add_css_class("dropping")
         return Gdk.DragAction.COPY
 
     def on_drop(self, _target, value, _x, _y):
         self.drop_zone.remove_css_class("dropping")
-        if isinstance(value, Gdk.FileList):
-            self.add_files(value.get_files())
-            return True
-        return False
+        try:
+            if isinstance(value, Gdk.FileList):
+                files = value.get_files()
+            elif isinstance(value, str):
+                files = [Gio.File.new_for_uri(u.strip()) for u in value.splitlines()
+                         if u.strip().startswith("file://")]
+            else:
+                log(f"drop: unexpected value {type(value).__name__}")
+                return False
+            log(f"drop: {len(files)} file(s)")
+            self.add_files(files)
+            return bool(files)
+        except Exception as e:  # noqa: BLE001 - a failed drop must not kill the panel
+            log(f"drop failed: {e!r}")
+            return False
 
     # -------------------------------------------------------------- devices
     def start_scan(self):
@@ -569,8 +616,9 @@ class AirDropApp(Adw.Application):
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
         self.css = Gtk.CssProvider()
         self.load_css()
+        # Above the user's gtk.css too: the panel's look is self-contained.
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
-                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
         # Follow wallpaper colour changes.
         self._colors_monitor = Gio.File.new_for_path(COLORS).monitor_file(Gio.FileMonitorFlags.NONE, None)
         self._colors_monitor.connect("changed", lambda *_: self.load_css())
@@ -578,6 +626,10 @@ class AirDropApp(Adw.Application):
 
     def load_css(self):
         self.css.load_from_string(theme_css())
+
+    def do_shutdown(self):
+        tell_bar("closed")
+        Adw.Application.do_shutdown(self)
 
     def do_command_line(self, cmd):
         args = cmd.get_arguments()[1:]
@@ -616,4 +668,11 @@ class AirDropApp(Adw.Application):
 
 
 if __name__ == "__main__":
+    # Launched detached from the bar: keep GTK's and Python's messages.
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(fd, 2)
+    except OSError:
+        pass
     sys.exit(AirDropApp().run(sys.argv))
