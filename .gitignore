@@ -6,3 +6,4 @@ packaging/*/owl/
 packaging/*/googletest/
 packaging/*/radiotap/
 packaging/*/omdrop-awdl/
+__pycache__/
