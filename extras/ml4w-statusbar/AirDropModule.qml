@@ -2,8 +2,8 @@ import Quickshell
 import QtQuick
 import qs.CustomTheme
 
-// Custom (not ML4W upstream): AirDrop. Click opens the AirDrop app; drop files
-// on it to open the app with those files ready to send.
+// Custom (not ML4W upstream): AirDrop. Click toggles the AirDrop panel, which
+// drops down under this icon; drop files on it to open the panel with them.
 // Installed by ~/.config/ml4w-statusbar/patch-airdrop.sh.
 Rectangle {
     id: airdrop
@@ -12,8 +12,13 @@ Rectangle {
     property bool focused: false
     readonly property bool active: mouseArea.containsMouse || focused || dropArea.containsDrag
 
+    // Screen x of this icon's centre: the bar spans the screen from x = 0.
+    function anchorX(): string {
+        return String(Math.round(airdrop.mapToItem(null, airdrop.width / 2, 0).x))
+    }
+
     function activate(): void {
-        Quickshell.execDetached(["airdrop-app"])
+        Quickshell.execDetached(["airdrop-app", "--toggle", "--at", anchorX()])
     }
 
     implicitWidth: 34
@@ -53,7 +58,7 @@ Rectangle {
                     paths.push(decodeURIComponent(s.substring(7)))
             }
             if (paths.length > 0) {
-                Quickshell.execDetached(["airdrop-app"].concat(paths))
+                Quickshell.execDetached(["airdrop-app", "--show", "--at", anchorX()].concat(paths))
                 drop.accept(Qt.CopyAction)
             }
         }

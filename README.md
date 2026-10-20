@@ -26,9 +26,9 @@ Set a regulatory domain (5 GHz is needed), e.g. `WIRELESS_REGDOM="US"` in `/etc/
 
 ## Use
 
-Open **AirDrop** (`airdrop-app`), drop or choose files, pick a device, Send. The other device must have AirDrop set to **Everyone**. Received files go to `~/Downloads` (set `download_dir` in `~/.config/airdrop/config.toml`); `confirm = false` there accepts without asking.
+`airdrop-app --toggle` opens a panel that drops down from the top of the screen (bind it to a key); drop or choose files, pick a device, Send. The other device must have AirDrop set to **Everyone**. Received files go to `~/Downloads` (set `download_dir` in `~/.config/airdrop/config.toml`); `confirm = false` there accepts without asking.
 
-`extras/ml4w-statusbar` adds a drop-target icon to the ML4W Quickshell bar.
+`extras/ml4w-statusbar` adds an AirDrop icon to the ML4W Quickshell bar: click to open the panel under it, or drop files on it.
 
 ## Licenses
 

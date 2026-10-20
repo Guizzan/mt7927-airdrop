@@ -1,23 +1,47 @@
 #!/usr/bin/env python3
-"""AirDrop for Linux: pick files (drop or choose), pick a nearby Apple device,
-send. A thin GTK front end over the `omdrop` command line."""
+"""AirDrop for Linux: a panel that drops down from the top bar. Pick files
+(drop or choose), pick a nearby Apple device, send. A thin GTK front end over
+the `omdrop` command line.
 
+  airdrop-app [--toggle | --show | --hide] [--at X] [FILE...]
+
+--at X centres the panel under screen x-coordinate X (the bar icon passes its
+own position) and is remembered for later calls, such as a keybind's --toggle.
+"""
+
+import ctypes
 import json
 import os
 import shutil
 import sys
 
-import gi
+# gtk4-layer-shell has to be loaded before libwayland, i.e. before Gtk.
+try:
+    ctypes.CDLL("libgtk4-layer-shell.so.0")
+except OSError:
+    pass
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+try:
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+except (ValueError, ImportError):
+    LayerShell = None
+
 APP_ID = "io.github.guizzan.AirDrop"
 OMDROP = shutil.which("omdrop") or os.path.expanduser("~/.local/bin/omdrop")
 WINDOW_MINUTES = 30          # visibility window requested from omdrop
-KEEPALIVE_S = 20 * 60        # renew it this often while the app is open
+KEEPALIVE_S = 20 * 60        # renew it this often while visible
 RESCAN_DELAY_S = 3           # pause between discovery rounds
+PANEL_WIDTH = 420
+PANEL_TOP = 68               # just below the ML4W bar island
+COLORS = os.path.expanduser("~/.config/ml4w/colors/colors.json")
+STATE = os.path.join(GLib.get_user_cache_dir(), "airdrop-app", "anchor")
 
 
 def human_size(n):
@@ -34,6 +58,60 @@ def device_icon(name):
     if "ipad" in n:
         return "tablet-symbolic"
     return "computer-symbolic"
+
+
+def theme_css():
+    """libadwaita colours and the bar's border, from the wallpaper palette."""
+    c = {"background": "#141313", "surface_container": "#201f1f",
+         "surface_container_high": "#2b2a2a", "primary": "#c8c6c5",
+         "on_primary": "#111111", "on_surface": "#e5e2e1", "outline": "#929090"}
+    try:
+        with open(COLORS) as f:
+            c.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    g = c.get
+    return f"""
+@define-color window_bg_color {g('background')};
+@define-color window_fg_color {g('on_surface')};
+@define-color view_bg_color {g('background')};
+@define-color view_fg_color {g('on_surface')};
+@define-color card_bg_color {g('surface_container')};
+@define-color card_fg_color {g('on_surface')};
+@define-color accent_bg_color {g('primary')};
+@define-color accent_fg_color {g('on_primary')};
+@define-color accent_color {g('primary')};
+@define-color popover_bg_color {g('surface_container')};
+@define-color dialog_bg_color {g('surface_container')};
+window.airdrop-panel {{ background: none; background-color: transparent; box-shadow: none; }}
+.panel-border {{
+  background: linear-gradient(to bottom, {g('primary')}, {g('on_primary')});
+  border-radius: 14px; padding: 2px;
+}}
+.panel {{ background: {g('background')}; border-radius: 12px; }}
+.panel-title {{ font-weight: bold; font-size: 1.05em; color: {g('primary')}; }}
+.drop-zone {{ border: 2px dashed alpha({g('primary')}, 0.35); border-radius: 12px;
+              background: alpha({g('surface_container')}, 0.6); }}
+.drop-zone.dropping {{ border-color: {g('primary')}; background: alpha({g('primary')}, 0.15); }}
+.drop-zone image {{ color: {g('primary')}; }}
+"""
+
+
+def read_anchor():
+    try:
+        with open(STATE) as f:
+            return int(float(f.read().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def write_anchor(x):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w") as f:
+            f.write(f"{x}\n")
+    except OSError:
+        pass
 
 
 class LineReader:
@@ -74,10 +152,18 @@ class LineReader:
         self.proc.force_exit()
 
 
-class AirDropWindow(Adw.ApplicationWindow):
+def run_quiet(argv, done=None):
+    p = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+    if done:
+        p.wait_async(None, lambda pr, res: (pr.wait_finish(res), done()))
+    return p
+
+
+class AirDropPanel(Gtk.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="AirDrop")
-        self.set_default_size(460, 640)
+        super().__init__(application=app, title="AirDrop", resizable=False)
+        self.add_css_class("airdrop-panel")
+        self.set_default_size(PANEL_WIDTH, -1)
         self.files = []            # Gio.File
         self.devices = {}          # name -> Adw.ActionRow
         self.selected = None       # device name
@@ -85,43 +171,63 @@ class AirDropWindow(Adw.ApplicationWindow):
         self.sender = None
         self.scan_source = 0
         self.keepalive_source = 0
+        self.pulse = 0
+        self._setting = False
 
+        self.layered = bool(LayerShell and LayerShell.is_supported())
+        if self.layered:
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "airdrop")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
+            LayerShell.set_exclusive_zone(self, -1)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, PANEL_TOP)
+        self.anchor_x = read_anchor()
+        self.place(self.anchor_x)
+        self.connect("map", lambda *_: self.place(self.anchor_x))
+
+        border = Gtk.Box(css_classes=["panel-border"], margin_top=4, margin_bottom=16,
+                         margin_start=16, margin_end=16)
         self.toasts = Adw.ToastOverlay()
-        toolbar = Adw.ToolbarView()
-        self.toasts.set_child(toolbar)
-        self.set_content(self.toasts)
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                        css_classes=["panel"], hexpand=True)
+        self.toasts.set_child(panel)
+        border.append(self.toasts)
+        self.set_child(border)
 
-        header = Adw.HeaderBar()
-        toolbar.add_top_bar(header)
-        vis_box = Gtk.Box(spacing=6)
-        vis_box.append(Gtk.Label(label="Visible"))
+        # Title row
+        top = Gtk.Box(spacing=8, margin_top=12, margin_start=16, margin_end=10)
+        top.append(Gtk.Image(icon_name="network-wireless-symbolic", css_classes=["panel-title"]))
+        top.append(Gtk.Label(label="AirDrop", css_classes=["panel-title"], hexpand=True, xalign=0))
+        top.append(Gtk.Label(label="Visible", css_classes=["dim-label"]))
         self.visible_switch = Gtk.Switch(valign=Gtk.Align.CENTER,
                                          tooltip_text="Let nearby Apple devices see and send to this PC")
         self.visible_switch.connect("notify::active", self.on_visible_toggled)
-        vis_box.append(self.visible_switch)
-        header.pack_end(vis_box)
+        top.append(self.visible_switch)
+        close = Gtk.Button(icon_name="window-close-symbolic", css_classes=["flat", "circular"],
+                           valign=Gtk.Align.CENTER, tooltip_text="Close (Esc)")
+        close.connect("clicked", lambda *_: self.hide_panel())
+        top.append(close)
+        panel.append(top)
 
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                       margin_top=12, margin_bottom=18, margin_start=18, margin_end=18)
-        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_child(page)
-        toolbar.set_content(scroller)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                       margin_start=16, margin_end=16)
+        panel.append(body)
 
         # Files: drop zone + chooser + list
-        self.drop_zone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                                 css_classes=["card", "drop-zone"])
-        self.drop_zone.set_size_request(-1, 150)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                        valign=Gtk.Align.CENTER, vexpand=True, margin_top=16, margin_bottom=16)
-        inner.append(Gtk.Image(icon_name="folder-download-symbolic", pixel_size=48,
-                               css_classes=["dim-label"]))
-        inner.append(Gtk.Label(label="Drop files here", css_classes=["title-4"]))
-        choose = Gtk.Button(label="Choose Files…", halign=Gtk.Align.CENTER,
-                            css_classes=["pill"])
+        self.drop_zone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                                 css_classes=["drop-zone"])
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                        valign=Gtk.Align.CENTER, margin_top=14, margin_bottom=14)
+        inner.append(Gtk.Image(icon_name="folder-download-symbolic", pixel_size=36))
+        inner.append(Gtk.Label(label="Drop files here"))
+        choose = Gtk.Button(label="Choose Files…", halign=Gtk.Align.CENTER, css_classes=["pill"])
         choose.connect("clicked", self.on_choose)
         inner.append(choose)
         self.drop_zone.append(inner)
-        page.append(self.drop_zone)
+        body.append(self.drop_zone)
 
         self.files_group = Adw.PreferencesGroup(title="Files")
         self.files_group.set_visible(False)
@@ -130,24 +236,28 @@ class AirDropWindow(Adw.ApplicationWindow):
         clear.connect("clicked", lambda *_: self.set_files([]))
         self.files_group.set_header_suffix(clear)
         self.file_rows = []
-        page.append(self.files_group)
+        self.files_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                               propagate_natural_height=True, max_content_height=200,
+                                               visible=False)
+        self.files_scroll.set_child(self.files_group)
+        body.append(self.files_scroll)
 
         # Devices
         self.dev_group = Adw.PreferencesGroup(
             title="Nearby Devices",
-            description="On the iPhone or Mac, set AirDrop to “Everyone for 10 Minutes”.")
+            description="Set AirDrop to “Everyone for 10 Minutes” on the other device.")
         self.scan_spinner = Adw.Spinner()
         self.dev_group.set_header_suffix(self.scan_spinner)
         self.empty_row = Adw.ActionRow(title="Looking for devices…",
                                        subtitle="Unlock the device and keep it nearby")
         self.empty_row.add_css_class("dim-label")
         self.dev_group.add(self.empty_row)
-        page.append(self.dev_group)
+        body.append(self.dev_group)
         self.radio_group = None    # Gtk.CheckButton group leader
 
         # Send bar
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
-                         margin_top=6, margin_bottom=12, margin_start=18, margin_end=18)
+                         margin_bottom=14, margin_start=16, margin_end=16)
         self.status = Gtk.Label(xalign=0, wrap=True, css_classes=["dim-label"])
         self.progress = Gtk.ProgressBar(visible=False)
         self.send_button = Gtk.Button(label="Send", css_classes=["suggested-action", "pill"],
@@ -157,18 +267,73 @@ class AirDropWindow(Adw.ApplicationWindow):
         bottom.append(self.progress)
         bottom.append(self.status)
         bottom.append(self.send_button)
-        toolbar.add_bottom_bar(bottom)
+        panel.append(bottom)
 
+        # Drops anywhere on the panel count, not only on the zone.
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.set_preload(True)
         drop.connect("drop", self.on_drop)
-        drop.connect("enter", lambda *_: (self.drop_zone.add_css_class("dropping"), Gdk.DragAction.COPY)[1])
+        drop.connect("enter", self.on_drag_enter)
         drop.connect("leave", lambda *_: self.drop_zone.remove_css_class("dropping"))
-        self.add_controller(drop)
+        panel.add_controller(drop)
 
-        self.connect("close-request", self.on_close)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        self.connect("close-request", self.on_close_request)
         self.update_send_button()
-        self.refresh_visibility()
-        self.start_scan()
+
+    # ----------------------------------------------------------- placement
+    def place(self, x):
+        if not self.layered:
+            return
+        self.anchor_x = x
+        width = None
+        surface = self.get_surface()
+        display = Gdk.Display.get_default()
+        mon = display.get_monitor_at_surface(surface) if display and surface else None
+        if mon is None and display and display.get_monitors().get_n_items():
+            mon = display.get_monitors().get_item(0)
+        if mon is not None:
+            width = mon.get_geometry().width
+        if x is None:
+            if width is None:
+                return            # placed again once mapped
+            x = width - 540       # roughly where the bar's right-hand icons sit
+        left = int(x) - PANEL_WIDTH // 2 - 16
+        if width is not None:
+            left = min(left, width - PANEL_WIDTH - 40)
+        LayerShell.set_margin(self, LayerShell.Edge.LEFT, max(8, left))
+
+    def show_panel(self):
+        was_visible = self.get_visible()
+        self.present()
+        if not was_visible:
+            self.refresh_visibility()
+            self.start_scan()
+
+    def hide_panel(self):
+        self.stop_scan()
+        self.set_visible(False)
+
+    def toggle(self):
+        if self.get_visible():
+            self.hide_panel()
+        else:
+            self.show_panel()
+
+    def on_key(self, _ctl, keyval, _code, state):
+        if keyval == Gdk.KEY_Escape:
+            self.hide_panel()
+            return True
+        if keyval in (Gdk.KEY_q, Gdk.KEY_Q) and state & Gdk.ModifierType.CONTROL_MASK:
+            self.get_application().quit()
+            return True
+        return False
+
+    def on_close_request(self, *_):
+        self.hide_panel()
+        return True               # keep running: the next toggle is instant
 
     # ---------------------------------------------------------------- files
     def set_files(self, files):
@@ -194,6 +359,7 @@ class AirDropWindow(Adw.ApplicationWindow):
             self.files_group.add(row)
             self.file_rows.append(row)
         self.files_group.set_visible(bool(self.files))
+        self.files_scroll.set_visible(bool(self.files))
         self.update_send_button()
 
     def add_files(self, files):
@@ -210,15 +376,21 @@ class AirDropWindow(Adw.ApplicationWindow):
             return
         self.add_files(model.get_item(i) for i in range(model.get_n_items()))
 
+    def on_drag_enter(self, *_):
+        self.drop_zone.add_css_class("dropping")
+        return Gdk.DragAction.COPY
+
     def on_drop(self, _target, value, _x, _y):
         self.drop_zone.remove_css_class("dropping")
-        self.add_files(value.get_files())
-        return True
+        if isinstance(value, Gdk.FileList):
+            self.add_files(value.get_files())
+            return True
+        return False
 
     # -------------------------------------------------------------- devices
     def start_scan(self):
         self.scan_source = 0
-        if self.scanner or self.sender:
+        if self.scanner or self.sender or not self.get_visible():
             return False
         self.scan_spinner.set_visible(True)
         try:
@@ -233,8 +405,6 @@ class AirDropWindow(Adw.ApplicationWindow):
         try:
             peer = json.loads(line)
         except ValueError:
-            if "radio is not running" in line or "not running" in line:
-                self.set_status("Turning the radio on…")
             return
         name = peer.get("name")
         if not name or name in self.devices:
@@ -259,7 +429,7 @@ class AirDropWindow(Adw.ApplicationWindow):
     def on_scan_done(self, _ok):
         self.scanner = None
         self.scan_spinner.set_visible(False)
-        if not self.sender and not self.scan_source:
+        if not self.sender and self.get_visible() and not self.scan_source:
             self.scan_source = GLib.timeout_add_seconds(RESCAN_DELAY_S, self.start_scan)
 
     def stop_scan(self):
@@ -269,6 +439,7 @@ class AirDropWindow(Adw.ApplicationWindow):
         if self.scanner:
             self.scanner.stop()
             self.scanner = None
+            self.scan_spinner.set_visible(False)
 
     def on_device_toggled(self, check, name):
         if check.get_active():
@@ -300,15 +471,15 @@ class AirDropWindow(Adw.ApplicationWindow):
         self.send_button.set_sensitive(False)
         self.progress.set_visible(True)
         self.pulse = GLib.timeout_add(120, lambda: (self.progress.pulse(), True)[1])
-        target = self.selected
+        self.send_target = self.selected
         files = [f.get_path() for f in self.files]
-        self.set_status(f"Looking for {target}…")
+        self.set_status(f"Looking for {self.send_target}…")
         if not self.visible_switch.get_active():
             # Sending needs the radio, which only runs while visible.
             self.visible_switch.set_active(True)
-        self.send_target = target
         self.send_lines = []
-        self.sender = LineReader([OMDROP, "send", target, *files], self.on_send_line, self.on_send_done)
+        self.sender = LineReader([OMDROP, "send", self.send_target, *files],
+                                 self.on_send_line, self.on_send_done)
 
     def on_send_line(self, line):
         line = line.strip()
@@ -324,7 +495,9 @@ class AirDropWindow(Adw.ApplicationWindow):
         self.set_status(line)
 
     def on_send_done(self, ok):
-        GLib.source_remove(self.pulse)
+        if self.pulse:
+            GLib.source_remove(self.pulse)
+            self.pulse = 0
         self.progress.set_visible(False)
         self.sender = None
         last = self.send_lines[-1] if self.send_lines else ""
@@ -351,27 +524,24 @@ class AirDropWindow(Adw.ApplicationWindow):
         self.visible_switch.set_active(on)
         self._setting = False
         if not on:
-            # Opening the app turns AirDrop on, as opening AirDrop on a Mac does.
+            # Opening AirDrop turns it on, as it does on a Mac.
             self.visible_switch.set_active(True)
         else:
             self.start_keepalive()
 
     def on_visible_toggled(self, sw, _pspec):
-        if getattr(self, "_setting", False):
+        if self._setting:
             return
         if sw.get_active():
-            Gio.Subprocess.new([OMDROP, "on", f"{WINDOW_MINUTES}m"], Gio.SubprocessFlags.STDOUT_SILENCE
-                               | Gio.SubprocessFlags.STDERR_SILENCE).wait_async(None, self._on_ready)
+            run_quiet([OMDROP, "on", f"{WINDOW_MINUTES}m"], self._on_ready)
             self.start_keepalive()
         else:
             if self.keepalive_source:
                 GLib.source_remove(self.keepalive_source)
                 self.keepalive_source = 0
-            Gio.Subprocess.new([OMDROP, "off"], Gio.SubprocessFlags.STDOUT_SILENCE
-                               | Gio.SubprocessFlags.STDERR_SILENCE)
+            run_quiet([OMDROP, "off"])
 
-    def _on_ready(self, proc, res):
-        proc.wait_finish(res)
+    def _on_ready(self):
         if not self.scanner and not self.sender:
             self.start_scan()
 
@@ -381,45 +551,68 @@ class AirDropWindow(Adw.ApplicationWindow):
 
     def _keepalive(self):
         if self.visible_switch.get_active():
-            Gio.Subprocess.new([OMDROP, "on", f"{WINDOW_MINUTES}m"], Gio.SubprocessFlags.STDOUT_SILENCE
-                               | Gio.SubprocessFlags.STDERR_SILENCE)
+            run_quiet([OMDROP, "on", f"{WINDOW_MINUTES}m"])
             return True
         self.keepalive_source = 0
-        return False
-
-    def on_close(self, *_):
-        self.stop_scan()
-        if self.sender:
-            self.sender.stop()
         return False
 
 
 class AirDropApp(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.win = None
+        self.css = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        css = Gtk.CssProvider()
-        css.load_from_string(
-            ".drop-zone { border: 2px dashed alpha(currentColor, 0.25); }"
-            ".drop-zone.dropping { border-color: @accent_color; background: alpha(@accent_bg_color, 0.12); }")
-        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
-                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        quit_action = Gio.SimpleAction.new("quit", None)
-        quit_action.connect("activate", lambda *_: self.quit())
-        self.add_action(quit_action)
-        self.set_accels_for_action("app.quit", ["<Control>q", "Escape"])
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        self.css = Gtk.CssProvider()
+        self.load_css()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        # Follow wallpaper colour changes.
+        self._colors_monitor = Gio.File.new_for_path(COLORS).monitor_file(Gio.FileMonitorFlags.NONE, None)
+        self._colors_monitor.connect("changed", lambda *_: self.load_css())
+        self.hold()               # stay resident while hidden
 
-    def do_activate(self):
+    def load_css(self):
+        self.css.load_from_string(theme_css())
+
+    def do_command_line(self, cmd):
+        args = cmd.get_arguments()[1:]
+        action, files, i = "show", [], 0
+        while i < len(args):
+            a = args[i]
+            if a in ("--toggle", "--show", "--hide"):
+                action = a[2:]
+            elif a == "--at" and i + 1 < len(args):
+                i += 1
+                try:
+                    x = int(float(args[i]))
+                    write_anchor(x)
+                    if self.win:
+                        self.win.place(x)
+                except ValueError:
+                    pass
+            elif a == "--quit":
+                self.quit()
+                return 0
+            else:
+                files.append(cmd.create_file_for_arg(a))
+            i += 1
         if not self.win:
-            self.win = AirDropWindow(self)
-        self.win.present()
-
-    def do_open(self, files, _n, _hint):
-        self.do_activate()
-        self.win.add_files(files)
+            self.win = AirDropPanel(self)
+        if files:
+            self.win.add_files(files)
+            action = "show"
+        if action == "toggle":
+            self.win.toggle()
+        elif action == "hide":
+            self.win.hide_panel()
+        else:
+            self.win.show_panel()
+        return 0
 
 
 if __name__ == "__main__":
